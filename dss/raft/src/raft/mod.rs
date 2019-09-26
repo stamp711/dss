@@ -1,24 +1,41 @@
-use std::sync::mpsc::{sync_channel, Receiver};
-use std::sync::Arc;
+use std::thread::spawn;
 
+use crossbeam_channel::Sender;
 use futures::sync::mpsc::UnboundedSender;
+use futures::sync::oneshot;
+use futures::Future;
+
 use labrpc::RpcFuture;
+
+use crate::proto::raftpb::*;
+
+use self::errors::*;
+use self::event::Event;
+use self::log::Log;
+use self::persister::*;
 
 #[cfg(test)]
 pub mod config;
 pub mod errors;
+mod event;
+mod log;
 pub mod persister;
 #[cfg(test)]
 mod tests;
-
-use self::errors::*;
-use self::persister::*;
-use crate::proto::raftpb::*;
 
 pub struct ApplyMsg {
     pub command_valid: bool,
     pub command: Vec<u8>,
     pub command_index: u64,
+}
+
+/// Describe the role of a raft peer
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RaftState {
+    Follower,
+    Candidate,
+    Leader,
+    Stopped,
 }
 
 /// State of a raft peer.
@@ -46,17 +63,33 @@ pub struct Raft {
     // Object to hold this peer's persisted state
     persister: Box<dyn Persister>,
     // this peer's index into peers[]
-    me: usize,
-    state: Arc<State>,
-    // Your data here (2A, 2B, 2C).
-    // Look at the paper's Figure 2 for a description of what
-    // state a Raft server must maintain.
+    me: u64,
+
+    state: RaftState,
+    term: u64,
+
+    log: Log,
+    commit_index: u64,
+    apply_index: u64,
+
+    apply_ch: UnboundedSender<ApplyMsg>,
+
+    /// Indicates a pending persist operation.
+    /// The pending persist must be performed before we communicate with the outside world.
+    need_persist: bool,
+    /// Indicates that we have new stabilized logs that can be applied to the RSM.
+    need_apply: bool,
+    /// The candidate that we voted for in the current term
+    voted_for: Option<u64>,
+
+    next_index: Vec<u64>,
+    match_index: Vec<u64>,
 }
 
 impl Raft {
     /// the service or tester wants to create a Raft server. the ports
     /// of all the Raft servers (including this one) are in peers. this
-    /// server's port is peers[me]. all the servers' peers arrays
+    /// server's port is peers\[me\]. all the servers' peers arrays
     /// have the same order. persister is a place for this server to
     /// save its persistent state, and also initially holds the most
     /// recent saved state, if any. apply_ch is a channel on which the
@@ -74,14 +107,24 @@ impl Raft {
         let mut rf = Raft {
             peers,
             persister,
-            me,
-            state: Arc::default(),
+            me: me as u64,
+            state: RaftState::Follower,
+            term: 0,
+            log: Log::new(),
+            commit_index: 0,
+            apply_index: 0,
+            apply_ch,
+            need_persist: false,
+            need_apply: false,
+            voted_for: None,
+            next_index: Default::default(),
+            match_index: Default::default(),
         };
 
         // initialize from state persisted before a crash
         rf.restore(&raft_state);
 
-        crate::your_code_here((rf, apply_ch))
+        rf
     }
 
     /// save Raft's persistent state to stable storage,
@@ -114,45 +157,46 @@ impl Raft {
         // }
     }
 
-    /// example code to send a RequestVote RPC to a server.
-    /// server is the index of the target server in peers.
-    /// expects RPC arguments in args.
-    ///
-    /// The labrpc package simulates a lossy network, in which servers
-    /// may be unreachable, and in which requests and replies may be lost.
-    /// This method sends a request and waits for a reply. If a reply arrives
-    /// within a timeout interval, This method returns Ok(_); otherwise
-    /// this method returns Err(_). Thus this method may not return for a while.
-    /// An Err(_) return can be caused by a dead server, a live server that
-    /// can't be reached, a lost request, or a lost reply.
-    ///
-    /// This method is guaranteed to return (perhaps after a delay) *except* if
-    /// the handler function on the server side does not return.  Thus there
-    /// is no need to implement your own timeouts around this method.
-    ///
-    /// look at the comments in ../labrpc/src/lib.rs for more details.
     fn send_request_vote(
         &self,
         server: usize,
         args: &RequestVoteArgs,
-    ) -> Receiver<Result<RequestVoteReply>> {
-        // Your code here if you want the rpc becomes async.
-        // Example:
-        // ```
-        // let peer = &self.peers[server];
-        // let (tx, rx) = channel();
-        // peer.spawn(
-        //     peer.request_vote(&args)
-        //         .map_err(Error::Rpc)
-        //         .then(move |res| {
-        //             tx.send(res);
-        //             Ok(())
-        //         }),
-        // );
-        // rx
-        // ```
-        let (tx, rx) = sync_channel::<Result<RequestVoteReply>>(1);
-        crate::your_code_here((server, args, tx, rx))
+        tx: Sender<RequestVoteReply>,
+    ) {
+        let peer = &self.peers[server];
+        peer.spawn(
+            peer.request_vote(&args)
+                .map_err(Error::Rpc)
+                .then(move |res| {
+                    if let Ok(res) = res {
+                        let _ = tx.send(res);
+                    };
+                    Ok(())
+                }),
+        );
+    }
+
+    fn send_append_entries_and_map_reply<F, M>(
+        &self,
+        server: usize,
+        args: AppendEntriesArgs,
+        f: F,
+        tx: Sender<M>,
+    ) where
+        F: FnOnce(AppendEntriesArgs, AppendEntriesReply) -> M + Send + 'static,
+        M: Send + 'static,
+    {
+        let peer = &self.peers[server];
+        peer.spawn(
+            peer.append_entries(&args)
+                .map_err(Error::Rpc)
+                .then(move |res| {
+                    if let Ok(res) = res {
+                        let _ = tx.send(f(args, res));
+                    }
+                    Ok(())
+                }),
+        );
     }
 
     fn start<M>(&self, command: &M) -> Result<(u64, u64)>
@@ -179,39 +223,36 @@ impl Raft {
     #[doc(hidden)]
     pub fn __suppress_deadcode(&mut self) {
         let _ = self.start(&0);
-        let _ = self.send_request_vote(0, &Default::default());
         self.persist();
         let _ = &self.state;
+        let _ = &self.term;
         let _ = &self.me;
         let _ = &self.persister;
         let _ = &self.peers;
+        let _ = &self.apply_ch;
     }
 }
 
-// Choose concurrency paradigm.
-//
-// You can either drive the raft state machine by the rpc framework,
-//
-// ```rust
-// struct Node { raft: Arc<Mutex<Raft>> }
-// ```
-//
-// or spawn a new thread runs the raft state machine and communicate via
-// a channel.
-//
-// ```rust
-// struct Node { sender: Sender<Msg> }
-// ```
 #[derive(Clone)]
 pub struct Node {
-    // Your code here.
+    tx: Sender<Event>,
 }
 
 impl Node {
     /// Create a new raft service.
     pub fn new(raft: Raft) -> Node {
-        // Your code here.
-        crate::your_code_here(raft)
+        let id = raft.me;
+        let (tx, rx) = crossbeam_channel::unbounded();
+
+        let event_tx = tx.clone();
+        let _ = spawn(move || raft.event_loop(rx, event_tx));
+
+        tx.send(Event::Hello {
+            msg: format!("Raft {} is online!", id),
+        })
+        .unwrap();
+
+        Node { tx }
     }
 
     /// the service using Raft (e.g. a k/v server) wants to start
@@ -230,34 +271,34 @@ impl Node {
     where
         M: labcodec::Message,
     {
-        // Your code here.
-        // Example:
-        // self.raft.start(command)
-        crate::your_code_here(command)
+        let mut command_buf = vec![];
+        labcodec::encode(command, &mut command_buf).map_err(Error::Encode)?;
+
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Event::StartCommand {
+                command: command_buf,
+                tx,
+            })
+            .unwrap_or_default();
+        rx.wait().unwrap_or(Err(Error::NotLeader))
     }
 
     /// The current term of this peer.
     pub fn term(&self) -> u64 {
-        // Your code here.
-        // Example:
-        // self.raft.term
-        crate::your_code_here(())
+        self.get_state().term
     }
 
     /// Whether this peer believes it is the leader.
     pub fn is_leader(&self) -> bool {
-        // Your code here.
-        // Example:
-        // self.raft.leader_id == self.id
-        crate::your_code_here(())
+        self.get_state().is_leader
     }
 
     /// The current state of this peer.
     pub fn get_state(&self) -> State {
-        State {
-            term: self.term(),
-            is_leader: self.is_leader(),
-        }
+        let (tx, rx) = oneshot::channel();
+        self.tx.send(Event::GetState { tx }).unwrap_or_default();
+        rx.wait().unwrap_or_default()
     }
 
     /// the tester calls kill() when a Raft instance won't be
@@ -269,16 +310,24 @@ impl Node {
     /// a VIRTUAL crash in tester, so take care of background
     /// threads you generated with this Raft Node.
     pub fn kill(&self) {
-        // Your code here, if desired.
+        self.tx.send(Event::Stop).unwrap();
     }
 }
 
+// CAVEATS: Please avoid locking or sleeping here, it may jam the network.
 impl RaftService for Node {
-    // example RequestVote RPC handler.
-    //
-    // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
+    fn append_entries(&self, args: AppendEntriesArgs) -> RpcFuture<AppendEntriesReply> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Event::AppendEntries { args, tx })
+            .unwrap_or_default();
+        Box::new(rx.map_err(labrpc::Error::Recv))
+    }
     fn request_vote(&self, args: RequestVoteArgs) -> RpcFuture<RequestVoteReply> {
-        // Your code here (2A, 2B).
-        crate::your_code_here(args)
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Event::RequestVote { args, tx })
+            .unwrap_or_default();
+        Box::new(rx.map_err(labrpc::Error::Recv))
     }
 }
