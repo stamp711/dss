@@ -77,13 +77,16 @@ impl Raft {
         // Broadcast AppendEntries right after leadership establishment
         let mut followers_need_update = true;
 
+        let mut last_broadcast = Instant::now();
         let mut timeout = gen_heartbeat_interval();
 
         while self.state == Leader {
             // 1. Update followers if needed
             if followers_need_update {
+                debug!("{:?} since last broadcast", Instant::now() - last_broadcast);
                 persist!(self);
                 self.broadcast_append_entries(tx.clone());
+                last_broadcast = Instant::now();
                 followers_need_update = false;
                 // Set new timeout
                 timeout = gen_heartbeat_interval();
@@ -265,6 +268,9 @@ impl Raft {
     }
 
     fn process_event(&mut self, event: Event) -> Option<Action> {
+        let start = Instant::now();
+        let t = format!("{:?}", event);
+
         let mut action = None;
 
         match event {
@@ -313,6 +319,13 @@ impl Raft {
             }
         };
 
+        let time_used = Instant::now() - start;
+        if time_used > Duration::from_millis(50) {
+            warn!(
+                "{} ({:?}) process event used {:?}, {}",
+                self.me, self.state, time_used, t
+            );
+        }
         action
     }
 
@@ -321,6 +334,7 @@ impl Raft {
             Err(Error::NotLeader)
         } else {
             let info = self.log.append_command(self.term, command);
+            self.need_persist = true;
             debug!("Start {:?}", info);
             Ok((info.index, info.term))
         }
@@ -550,6 +564,7 @@ impl Raft {
         self.term = term;
         self.state = Follower;
         self.voted_for = None;
+        self.need_persist = true;
     }
 
     /// Send AppendEntries to all other peers
@@ -565,6 +580,7 @@ impl Raft {
                         last_included_info: self.log.get_log_info(self.log.start_index()),
                         data: self.persister.snapshot(),
                     };
+                    unimplemented!()
                 } else {
                     // Send AppendEntries
                     let args = AppendEntriesArgs {

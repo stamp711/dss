@@ -56,6 +56,16 @@ impl State {
     }
 }
 
+#[derive(Message)]
+struct PersistState {
+    #[prost(uint64, required, tag = "1")]
+    pub term: u64,
+    #[prost(uint64, optional, tag = "2")]
+    pub voted_for: Option<u64>,
+    #[prost(message, required, tag = "3")]
+    pub log: Log,
+}
+
 // A single Raft peer.
 pub struct Raft {
     // RPC end points of all peers
@@ -115,7 +125,7 @@ impl Raft {
             apply_index: 0,
             apply_ch,
             need_persist: false,
-            need_apply: false,
+            need_apply: true,
             voted_for: None,
             next_index: Default::default(),
             match_index: Default::default(),
@@ -131,11 +141,25 @@ impl Raft {
     /// where it can later be retrieved after a crash and restart.
     /// see paper's Figure 2 for a description of what should be persistent.
     fn persist(&mut self) {
-        // Your code here (2C).
-        // Example:
-        // labcodec::encode(&self.xxx, &mut data).unwrap();
-        // labcodec::encode(&self.yyy, &mut data).unwrap();
-        // self.persister.save_raft_state(data);
+        let state = self.get_persist_state();
+        let mut data = vec![];
+        labcodec::encode(&state, &mut data).unwrap();
+        self.persister.save_raft_state(data);
+        self.need_persist = false;
+    }
+
+    fn get_persist_state(&self) -> PersistState {
+        PersistState {
+            term: self.term,
+            voted_for: self.voted_for,
+            log: self.log.clone(),
+        }
+    }
+
+    fn load_persist_state(&mut self, state: PersistState) {
+        self.term = state.term;
+        self.voted_for = state.voted_for;
+        self.log = state.log;
     }
 
     /// restore previously persisted state.
@@ -144,17 +168,10 @@ impl Raft {
             // bootstrap without any state?
             return;
         }
-        // Your code here (2C).
-        // Example:
-        // match labcodec::decode(data) {
-        //     Ok(o) => {
-        //         self.xxx = o.xxx;
-        //         self.yyy = o.yyy;
-        //     }
-        //     Err(e) => {
-        //         panic!("{:?}", e);
-        //     }
-        // }
+        match labcodec::decode(data) {
+            Ok(state) => self.load_persist_state(state),
+            Err(e) => panic!("{}", e),
+        }
     }
 
     fn send_request_vote(
@@ -281,7 +298,7 @@ impl Node {
                 tx,
             })
             .unwrap_or_default();
-        rx.wait().unwrap_or(Err(Error::NotLeader))
+        rx.wait().unwrap()
     }
 
     /// The current term of this peer.
@@ -298,7 +315,7 @@ impl Node {
     pub fn get_state(&self) -> State {
         let (tx, rx) = oneshot::channel();
         self.tx.send(Event::GetState { tx }).unwrap_or_default();
-        rx.wait().unwrap_or_default()
+        rx.wait().unwrap()
     }
 
     /// the tester calls kill() when a Raft instance won't be

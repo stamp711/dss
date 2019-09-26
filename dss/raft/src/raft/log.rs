@@ -6,9 +6,12 @@ impl LogInfo {
     }
 }
 
+#[derive(Clone, Message)]
 pub struct Log {
-    start_index: u64,
-    entries: Vec<LogEntry>,
+    #[prost(uint64, tag = "1")]
+    pub start_index: u64,
+    #[prost(message, repeated, tag = "2")]
+    pub entries: Vec<LogEntry>,
 }
 
 impl Log {
@@ -88,7 +91,13 @@ impl Log {
         let begin_idx = (begin_index - self.start_index) as usize;
         let end_idx = (end_index - self.start_index) as usize;
 
-        self.entries.splice(begin_idx.., entries.iter().cloned());
+        if end_idx > self.entries.len() {
+            self.entries.splice(begin_idx.., entries.iter().cloned());
+        } else {
+            self.entries
+                .splice(begin_idx..end_idx, entries.iter().cloned());
+        };
+
         if end_idx < self.entries.len()
             && self.entries[end_idx].info.term < self.entries[end_idx - 1].info.term
         {
