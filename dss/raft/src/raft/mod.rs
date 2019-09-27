@@ -298,7 +298,7 @@ impl Node {
                 tx,
             })
             .unwrap_or_default();
-        rx.wait().unwrap()
+        rx.wait().unwrap_or(Err(Error::NotLeader))
     }
 
     /// The current term of this peer.
@@ -315,7 +315,7 @@ impl Node {
     pub fn get_state(&self) -> State {
         let (tx, rx) = oneshot::channel();
         self.tx.send(Event::GetState { tx }).unwrap_or_default();
-        rx.wait().unwrap()
+        rx.wait().unwrap_or_default()
     }
 
     /// the tester calls kill() when a Raft instance won't be

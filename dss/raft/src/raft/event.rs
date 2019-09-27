@@ -67,6 +67,16 @@ impl Raft {
                 Stopped => {}
             }
         }
+
+        // After Raft state transfers to Stopped, though events rx will be dropped,
+        // pending events in the channel buffer will not be cleaned.
+        // When state transfers to Stopped, we need to ensure clean shutdown.
+
+        // Drop events Sender
+        drop(tx);
+        // Cancel all remaining events while channel is still connected (have other Senders)
+        events.iter().for_each(drop);
+        debug!("Raft {} reached clean shutdown", self.me);
     }
 
     fn leader_loop(&mut self, events: &Receiver<Event>, tx: &Sender<Event>) {
@@ -268,9 +278,6 @@ impl Raft {
     }
 
     fn process_event(&mut self, event: Event) -> Option<Action> {
-        let start = Instant::now();
-        let t = format!("{:?}", event);
-
         let mut action = None;
 
         match event {
@@ -319,13 +326,6 @@ impl Raft {
             }
         };
 
-        let time_used = Instant::now() - start;
-        if time_used > Duration::from_millis(50) {
-            warn!(
-                "{} ({:?}) process event used {:?}, {}",
-                self.me, self.state, time_used, t
-            );
-        }
         action
     }
 
