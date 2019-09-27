@@ -215,39 +215,6 @@ impl Raft {
                 }),
         );
     }
-
-    fn start<M>(&self, command: &M) -> Result<(u64, u64)>
-    where
-        M: labcodec::Message,
-    {
-        let index = 0;
-        let term = 0;
-        let is_leader = true;
-        let mut buf = vec![];
-        labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
-        // Your code here (2B).
-
-        if is_leader {
-            Ok((index, term))
-        } else {
-            Err(Error::NotLeader)
-        }
-    }
-}
-
-impl Raft {
-    /// Only for suppressing deadcode warnings.
-    #[doc(hidden)]
-    pub fn __suppress_deadcode(&mut self) {
-        let _ = self.start(&0);
-        self.persist();
-        let _ = &self.state;
-        let _ = &self.term;
-        let _ = &self.me;
-        let _ = &self.persister;
-        let _ = &self.peers;
-        let _ = &self.apply_ch;
-    }
 }
 
 #[derive(Clone)]
