@@ -1,5 +1,7 @@
 use std::{error, fmt, result};
 
+use futures::Future;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
     NoLeader,
@@ -20,3 +22,4 @@ impl error::Error for Error {
 }
 
 pub type Result<T> = result::Result<T, Error>;
+pub type KvRaftFuture<T> = Box<dyn Future<Item = T, Error = Error>>;

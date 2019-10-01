@@ -1,34 +1,38 @@
-syntax = "proto3";
+syntax = "proto2";
 
 package kvraftpb;
 
 enum Op {
-    Unknown = 0;
-    Put = 1;
-    Append = 2;
+    Put = 0;
+    Append = 1;
+}
+
+message RpcId {
+    required string client_name = 1;
+    required uint64 seq_id = 2;
 }
 
 /// Put or Append
 message PutAppendRequest {
-    string key = 1;
-    string value = 2;
+    required RpcId info = 1;
+    required string key = 2;
+    required string value = 3;
     // "Put" or "Append"
-    Op op = 3;
-    // You'll have to add definitions here.
+    required Op op = 4;
 }
 
 message PutAppendReply {
-    bool wrong_leader = 1;
-    string err = 2;
+    required bool wrong_leader = 1;
+    optional string err = 2;
 }
 
 message GetRequest {
-    string key = 1;
-    // You'll have to add definitions here.
+    required RpcId info = 1;
+    required string key = 2;
 }
 
 message GetReply {
-    bool wrong_leader = 1;
-    string err = 2;
-    string value = 3;
+    required bool wrong_leader = 1;
+    optional string err = 2;
+    required string value = 3;
 }

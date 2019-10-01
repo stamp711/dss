@@ -518,6 +518,7 @@ impl Raft {
                     command_valid: true,
                     command: log.command,
                     command_index: log.info.index,
+                    command_term: log.info.term,
                 });
             }
             self.apply_index = self.commit_index;
