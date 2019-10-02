@@ -7,7 +7,7 @@ use rand::{thread_rng, Rng};
 use crate::proto::raftpb::*;
 use crate::raft::errors::*;
 use crate::raft::RaftState::*;
-use crate::raft::{ApplyMsg, Raft, State};
+use crate::raft::{ApplyMsg, ApplyMsgExt, Raft, State};
 
 const START_BATCH_MS: u64 = 2;
 const COMMIT_BATCH_MS: u64 = 30;
@@ -90,6 +90,13 @@ impl Raft {
         let mut last_broadcast = Instant::now();
         let mut timeout = gen_heartbeat_interval();
 
+        // Let apply handler know we just become leader
+        let _ = self.apply_ch.unbounded_send(ApplyMsg {
+            command_valid: false,
+            ext: Some(ApplyMsgExt::ObtainLeadership),
+            ..Default::default()
+        });
+
         while self.state == Leader {
             // 1. Update followers if needed
             if followers_need_update {
@@ -154,6 +161,13 @@ impl Raft {
                 _ => unreachable!(),
             }
         }
+
+        // Let apply handler know we just lost leadership
+        let _ = self.apply_ch.unbounded_send(ApplyMsg {
+            command_valid: false,
+            ext: Some(ApplyMsgExt::LostLeadership),
+            ..Default::default()
+        });
     }
 
     fn candidate_loop(&mut self, events: &Receiver<Event>) {
@@ -519,6 +533,7 @@ impl Raft {
                     command: log.command,
                     command_index: log.info.index,
                     command_term: log.info.term,
+                    ext: None,
                 });
             }
             self.apply_index = self.commit_index;

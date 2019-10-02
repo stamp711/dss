@@ -6,11 +6,10 @@ use futures::future::ok;
 use futures::sync::mpsc::{unbounded, UnboundedReceiver};
 use futures::sync::oneshot;
 use futures::{Future, Stream};
-
 use labrpc::RpcFuture;
 
 use crate::proto::kvraftpb::*;
-use crate::raft;
+use crate::raft::{self, ApplyMsgExt::*};
 
 /// States that are shared between apply_handler and RPC threads
 #[derive(Debug, Default)]
@@ -58,7 +57,7 @@ impl SharedServerState {
                         }
                     }
                 }
-                _ => unreachable!(),
+                _ => {}
             }
         }
         // Update latest seq_id
@@ -71,6 +70,12 @@ impl SharedServerState {
     pub fn notify(&self, index: u64, term: u64) {
         if let Some(tx) = self.req.lock().unwrap().remove(&index) {
             let _ = tx.send(term);
+        }
+    }
+
+    pub fn notify_fail_all(&self) {
+        for (_, tx) in self.req.lock().unwrap().drain() {
+            let _ = tx.send(0);
         }
     }
 }
@@ -113,10 +118,28 @@ impl KvServer {
         for msg in self.apply_ch.take().unwrap().wait() {
             let msg = msg.unwrap();
             if msg.command_valid {
+                // Normal commands for state machine
                 let kv_cmd = labcodec::decode(&msg.command).unwrap();
                 self.state.apply_command(kv_cmd);
                 self.state.notify(msg.command_index, msg.command_term);
                 self.apply_index = msg.command_index;
+            } else {
+                // ApplyMsgExt
+                if let Some(ext) = msg.ext {
+                    match ext {
+                        ObtainLeadership => {
+                            // Start Nop command to help commit
+                            let _ = self.rf.start(&KvCommand {
+                                command: CommandType::Nop as i32,
+                                ..Default::default()
+                            });
+                        }
+                        LostLeadership => {
+                            // Drop all outstanding operations
+                            self.state.notify_fail_all();
+                        }
+                    }
+                }
             }
         }
     }
@@ -154,12 +177,11 @@ impl Node {
     }
 
     pub fn get_state(&self) -> raft::State {
-        // Your code here.
-        raft::State {
-            ..Default::default()
-        }
+        self.rf.get_state()
     }
 
+    /// Start a `KvCommand` in raft, return a Future that
+    /// will be resolved when the command commits or fails
     fn submit_to_raft(&self, command: &KvCommand) -> RpcFuture<(bool, Option<String>)> {
         let mut req_guard = self.state.req.lock().unwrap();
 
@@ -189,11 +211,13 @@ impl Node {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Enumeration)]
 enum CommandType {
-    Get = 0,
-    Put = 1,
-    Append = 2,
+    Nop = 0,
+    Get = 1,
+    Put = 2,
+    Append = 3,
 }
 
+/// `KvCommand` is what we are start()ing in raft
 #[derive(Message)]
 struct KvCommand {
     #[prost(message, required, tag = "1")]
@@ -211,7 +235,7 @@ impl KvService for Node {
     fn get(&self, args: GetRequest) -> RpcFuture<GetReply> {
         // Check for duplicate
         if self.state.rpc_seen(&args.info) {
-            // If seen, directly read and return
+            // If RpcId seen, directly read and return
             let value = self.state.kvs.read().unwrap().get(&args.key).cloned();
             return Box::new(ok(GetReply {
                 wrong_leader: false,

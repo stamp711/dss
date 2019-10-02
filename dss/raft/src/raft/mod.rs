@@ -23,11 +23,19 @@ pub mod persister;
 #[cfg(test)]
 mod tests;
 
+#[derive(Debug, Default)]
 pub struct ApplyMsg {
     pub command_valid: bool,
     pub command: Vec<u8>,
     pub command_index: u64,
     pub command_term: u64,
+    pub ext: Option<ApplyMsgExt>,
+}
+
+#[derive(Debug)]
+pub enum ApplyMsgExt {
+    ObtainLeadership,
+    LostLeadership,
 }
 
 /// Describe the role of a raft peer
