@@ -119,7 +119,7 @@ impl Raft {
             if followers_need_update {
                 debug!("{:?} since last broadcast", Instant::now() - last_broadcast);
                 persist!(self);
-                self.broadcast_append_entries(tx.clone());
+                self.broadcast_updates_to_followers(tx.clone());
                 last_broadcast = Instant::now();
                 followers_need_update = false;
                 // Set new timeout
@@ -716,20 +716,20 @@ impl Raft {
         self.need_persist = true;
     }
 
-    /// Send AppendEntries to all other peers
-    fn broadcast_append_entries(&self, tx: Sender<Event>) {
+    /// Send updates to all other peers
+    fn broadcast_updates_to_followers(&self, tx: Sender<Event>) {
         for (id, _) in self.peers.iter().enumerate() {
             if id as u64 != self.me {
                 let prev_log_index = self.next_index[id] - 1;
                 if prev_log_index < self.log.start_index() {
                     // Send InstallSnapshot
-                    let _args = InstallSnapshotArgs {
+                    let args = InstallSnapshotArgs {
                         term: self.term,
                         leader_id: self.me,
                         last_included_info: self.log.get_log_info(self.log.start_index()),
                         data: self.persister.snapshot(),
                     };
-                    unimplemented!()
+                    self.update_follower_using_install_snapshot(id as u64, args, tx.clone());
                 } else {
                     // Send AppendEntries
                     let args = AppendEntriesArgs {
@@ -739,13 +739,41 @@ impl Raft {
                         entries: self.log.get_entries_starting_at(prev_log_index + 1),
                         leader_commit: self.commit_index,
                     };
-                    self.update_follower(id as u64, args, tx.clone());
+                    self.update_follower_using_append_entries(id as u64, args, tx.clone());
                 }
             }
         }
     }
 
-    fn update_follower(&self, peer: u64, args: AppendEntriesArgs, tx: Sender<Event>) {
+    fn update_follower_using_install_snapshot(
+        &self,
+        peer: u64,
+        args: InstallSnapshotArgs,
+        tx: Sender<Event>,
+    ) {
+        self.send_install_snapshot_and_map_reply(
+            peer as usize,
+            args,
+            move |args, reply| {
+                Event::UpdateFollowerSummary(UpdateFollowerSummary {
+                    send_term: args.term,
+                    peer,
+                    expected_synced_log_index: args.last_included_info.index,
+                    peer_ok: reply.success,
+                    peer_term: reply.term,
+                    peer_conflicting_index: 0,
+                })
+            },
+            tx,
+        );
+    }
+
+    fn update_follower_using_append_entries(
+        &self,
+        peer: u64,
+        args: AppendEntriesArgs,
+        tx: Sender<Event>,
+    ) {
         self.send_append_entries_and_map_reply(
             peer as usize,
             args,

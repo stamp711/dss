@@ -237,6 +237,29 @@ impl Raft {
                 }),
         );
     }
+
+    fn send_install_snapshot_and_map_reply<F, M>(
+        &self,
+        server: usize,
+        args: InstallSnapshotArgs,
+        f: F,
+        tx: Sender<M>,
+    ) where
+        F: FnOnce(InstallSnapshotArgs, InstallSnapshotReply) -> M + Send + 'static,
+        M: Send + 'static,
+    {
+        let peer = &self.peers[server];
+        peer.spawn(
+            peer.install_snapshot(&args)
+                .map_err(Error::Rpc)
+                .then(move |res| {
+                    if let Ok(res) = res {
+                        let _ = tx.send(f(args, res));
+                    }
+                    Ok(())
+                }),
+        );
+    }
 }
 
 #[derive(Clone)]
