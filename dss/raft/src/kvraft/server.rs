@@ -18,7 +18,7 @@ use crate::raft::{self, ApplyMsgExt::*};
 struct SharedServerState {
     /// Storage for KV pairs
     pub kvs: Arc<RwLock<HashMap<String, String>>>,
-    /// Outstanding operations started in raft (index -> Rx<term>)
+    /// Outstanding RSM commands started in raft (index -> Rx<term>)
     pub req: Mutex<HashMap<u64, oneshot::Sender<u64>>>,
     /// Last seen seqID of each client
     pub latest: RwLock<HashMap<String, u64>>,
@@ -33,6 +33,7 @@ impl SharedServerState {
         }
     }
 
+    /// Have we already processed this RPC through raft?
     pub fn rpc_needs_apply(&self, info: &RpcId) -> bool {
         match self.latest.read().unwrap().get(&info.client_name) {
             Some(seq_id) => info.seq_id > *seq_id,
@@ -40,6 +41,7 @@ impl SharedServerState {
         }
     }
 
+    /// Apply a `KvCommand` on RSM.
     pub fn apply_command(&self, cmd: KvCommand) {
         if self.rpc_needs_apply(&cmd.info) {
             match cmd.command {
@@ -69,12 +71,17 @@ impl SharedServerState {
             .insert(cmd.info.client_name, cmd.info.seq_id);
     }
 
+    /// Notify a registered outgoing request (through its `index` when rf.start() is called)
+    /// that some command with same index has been applied. Give the applied command's `term`
+    /// should be sufficient for it to know whether the applied command is itself.
     pub fn notify(&self, index: u64, term: u64) {
         if let Some(tx) = self.req.lock().unwrap().remove(&index) {
             let _ = tx.send(term);
         }
     }
 
+    /// Notify a registered outgoing request that it failed using special term `0`.
+    /// (We use term `0` because raft term 0 is guaranteed to not have a leader)
     pub fn notify_fail_between(&self, first: u64, last: u64) {
         let mut guard = self.req.lock().unwrap();
         for index in first..=last {
@@ -84,6 +91,7 @@ impl SharedServerState {
         }
     }
 
+    /// Notify all registered outgoing request that they failed using special term `0`.
     pub fn notify_fail_all(&self) {
         for (_, tx) in self.req.lock().unwrap().drain() {
             let _ = tx.send(0);
@@ -92,20 +100,28 @@ impl SharedServerState {
 }
 
 pub struct KvServer {
+    /// Raft peer associated with this `KvServer`
     pub rf: raft::Node,
     me: usize,
-    // snapshot if log grows this big
+    /// Snapshot if log grows this big
     maxraftstate: Option<usize>,
+    /// Latest raft persistent data size
     raft_state_size: usize,
+    /// Channel for `ApplyMsg`s
     apply_ch: Option<UnboundedReceiver<raft::ApplyMsg>>,
+    /// Last applied RSM command index
     apply_index: u64,
-    last_do_snapshot_index: u64,
+    /// Index of last included command in the newest snapshot
+    snapshot_index: u64,
+    /// Shared data between `apply_handler` and RPC threads
     state: Arc<SharedServerState>,
 }
 
+/// If raft persistent data size reached this times `maxraftstate`, generate a new snapshot.
 const SNAPSHOT_THRESHOLD: f64 = 1.0;
 
 impl KvServer {
+    /// Creates a `KvServer`.
     pub fn new(
         servers: Vec<crate::proto::raftpb::RaftClient>,
         me: usize,
@@ -125,7 +141,7 @@ impl KvServer {
             raft_state_size: 0,
             apply_ch: Some(apply_ch),
             apply_index: 0,
-            last_do_snapshot_index: 0,
+            snapshot_index: 0,
             state: Default::default(),
         };
 
@@ -137,6 +153,7 @@ impl KvServer {
         kv
     }
 
+    /// Handler for raft's `ApplyMsg`s. It owns the `KvServer`.
     pub fn apply_handler(mut self) {
         for msg in self.apply_ch.take().unwrap().wait() {
             let msg = msg.unwrap();
@@ -158,6 +175,7 @@ impl KvServer {
                         }
 
                         RaftStateSize(size) => {
+                            // Log the newest raft persistent data size
                             self.raft_state_size = size;
                         }
 
@@ -177,7 +195,7 @@ impl KvServer {
                         InstallSnapshot(data) => {
                             let old_apply_index = self.apply_index;
                             self.load_snapshot(labcodec::decode(&data).unwrap());
-                            // Notify all previous outgoing req that it failed
+                            // Notify all outgoing requests before the snapshot that they have failed
                             self.state
                                 .notify_fail_between(old_apply_index + 1, self.apply_index);
                         }
@@ -185,10 +203,13 @@ impl KvServer {
                 }
             }
 
+            // Do snapshot if needed
             if let Some(cap) = self.maxraftstate {
-                if !msg.has_more_to_apply
+                if !msg.has_more_to_apply // If have more RSM commands in this batch, snapshotting can be delayed
+                    // Is raft persistent data size reaching the threshold?
                     && self.raft_state_size >= (SNAPSHOT_THRESHOLD * cap as f64) as usize
-                    && self.last_do_snapshot_index < self.apply_index
+                    // Has RSM been updated since last snapshot?
+                    && self.snapshot_index < self.apply_index
                 {
                     self.do_snapshot();
                 }
@@ -196,6 +217,7 @@ impl KvServer {
         }
     }
 
+    /// Load RSM state from a snapshot.
     fn load_snapshot(&mut self, data: KvSnapshot) {
         let mut kvs_guard = self.state.kvs.write().unwrap();
         let mut latest_guard = self.state.latest.write().unwrap();
@@ -204,6 +226,7 @@ impl KvServer {
         self.apply_index = data.apply_index;
     }
 
+    /// Generate a snapshot of RSM and send it to raft.
     fn do_snapshot(&mut self) {
         // Generate snapshot data
         let snapshot = KvSnapshot {
@@ -217,10 +240,13 @@ impl KvServer {
         labcodec::encode(&snapshot, &mut data).unwrap();
         self.rf.save_snapshot(self.apply_index, data);
 
-        self.last_do_snapshot_index = self.apply_index;
+        self.snapshot_index = self.apply_index;
     }
 }
 
+/// `Node` provides the KvServer service, and can be cloned and shared between threads.
+/// The RPC have no timeout mechanism, thus they rely on `apply_handler` to notify that
+/// they have failed. (e.g. when associated raft peer has lost leadership.)
 #[derive(Clone)]
 pub struct Node {
     rf: raft::Node,
@@ -228,6 +254,7 @@ pub struct Node {
 }
 
 impl Node {
+    /// Crate a kv node.
     pub fn new(kv: KvServer) -> Node {
         let node = Node {
             rf: kv.rf.clone(),
@@ -252,6 +279,7 @@ impl Node {
         self.get_state().is_leader()
     }
 
+    /// Get associated raft peer's state.
     pub fn get_state(&self) -> raft::State {
         self.rf.get_state()
     }

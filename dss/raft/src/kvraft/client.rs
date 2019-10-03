@@ -15,10 +15,18 @@ enum Op {
     Append(String, String),
 }
 
+/// `Clerk` represents a single kvraft client.
+/// To achieve linearizability, a `Clerk` should only have one outgoing RPC request at a time.
 pub struct Clerk {
+    /// The name of the client.
     pub name: String,
+    /// The endpoints of kvraft servers.
     pub servers: Vec<KvClient>,
+    /// Remembered leader for RPC.
     leader: Cell<u64>,
+    /// Unique id for next RPC request.
+    /// kvraft use this together with `Clerk`'s name to identify each RPC request.
+    /// This grows strictly (one for each RPC request).
     seq_id: Cell<u64>,
 }
 
@@ -49,9 +57,9 @@ impl Clerk {
         info
     }
 
-    /// fetch the current value for a key.
-    /// returns "" if the key does not exist.
-    /// keeps trying forever in the face of all other errors.
+    /// Fetch the current value for a key.
+    /// Returns "" if the key does not exist.
+    /// Keeps trying forever in the face of all other errors.
     //
     // you can send an RPC with code like this:
     // let reply = self.servers[i].get(args).unwrap();
