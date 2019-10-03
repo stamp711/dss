@@ -1,3 +1,5 @@
+//! Errors used in raft
+
 use std::{error, fmt, result};
 
 use labcodec;

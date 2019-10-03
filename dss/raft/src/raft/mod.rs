@@ -23,28 +23,41 @@ pub mod persister;
 #[cfg(test)]
 mod tests;
 
+/// Message that is sent in the apply channel
 #[derive(Debug, Default)]
 pub struct ApplyMsg {
+    /// Indicates whether this message contains valid command for RSM
     pub command_valid: bool,
+    /// Encoded command for RSM. Could be empty
     pub command: Vec<u8>,
+    /// Log index for this RSM command
     pub command_index: u64,
+    /// Term for this RSM command
     pub command_term: u64,
+    /// When `command_valid` is false, this contains extra information
     pub ext: Option<ApplyMsgExt>,
+    /// Indicates whether more RSM commands will be sent in this batch
     pub has_more_to_apply: bool,
 }
 
+/// Information to send when `command_valid` is false.
 #[derive(Debug)]
 pub enum ApplyMsgExt {
+    /// Indicates that raft is stopped.
     Stopped,
+    /// Indicates that this raft has just became leader.
     ObtainLeadership,
+    /// Indicates that this raft has just lost leadership.
     LostLeadership,
+    /// Indicates that this raft have new persistent data size.
     RaftStateSize(usize),
+    /// Indicates that this raft wants the RSM to load a snapshot.
     InstallSnapshot(Vec<u8>),
 }
 
 /// Describe the role of a raft peer
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum RaftState {
+enum RaftState {
     Follower,
     Candidate,
     Leader,
@@ -54,7 +67,9 @@ pub enum RaftState {
 /// State of a raft peer.
 #[derive(Default, Clone, Debug)]
 pub struct State {
+    /// This peer's term.
     pub term: u64,
+    /// Whether this peer believes it is the leader.
     pub is_leader: bool,
 }
 
@@ -79,7 +94,9 @@ struct PersistState {
     pub log: Log,
 }
 
-// A single Raft peer.
+/// A single Raft peer.
+/// After booting, it is owned by the event loop thread.
+/// `Node`s send events to the event loop using a channel.
 pub struct Raft {
     // RPC end points of all peers
     peers: Vec<RaftClient>,
@@ -154,7 +171,7 @@ impl Raft {
     /// where it can later be retrieved after a crash and restart.
     /// see paper's Figure 2 for a description of what should be persistent.
     fn persist(&mut self) {
-        let state = self.get_persist_state();
+        let state = self.generate_persist_state();
         let mut data = vec![];
         labcodec::encode(&state, &mut data).unwrap();
         self.persister.save_raft_state(data);
@@ -163,7 +180,8 @@ impl Raft {
         self.need_persist = false;
     }
 
-    fn get_persist_state(&self) -> PersistState {
+    /// Generate information that should be persisted.
+    fn generate_persist_state(&self) -> PersistState {
         PersistState {
             term: self.term,
             voted_for: self.voted_for,
@@ -171,6 +189,7 @@ impl Raft {
         }
     }
 
+    /// Restore from decoded persisted state.
     fn load_persist_state(&mut self, state: PersistState) {
         self.term = state.term;
         self.voted_for = state.voted_for;
@@ -184,18 +203,17 @@ impl Raft {
         self.have_new_persist_state_size = true;
     }
 
-    /// restore previously persisted state.
+    /// Restore previously persisted state.
     fn restore(&mut self, data: &[u8]) {
         if data.is_empty() {
             // bootstrap without any state?
             return;
         }
-        match labcodec::decode(data) {
-            Ok(state) => self.load_persist_state(state),
-            Err(e) => panic!("{}", e),
-        }
+        self.load_persist_state(labcodec::decode(data).unwrap());
     }
 
+    /// Send RequestVote to a peer, and send reply to tx.
+    /// Will not send anything to tx if there's no reply.
     fn send_request_vote(
         &self,
         server: usize,
@@ -215,6 +233,8 @@ impl Raft {
         );
     }
 
+    /// Send AppendEntries to a peer, map reply to `M` and send it to `tx`.
+    /// Will not send anything to tx if there's no reply.
     fn send_append_entries_and_map_reply<F, M>(
         &self,
         server: usize,
@@ -238,6 +258,8 @@ impl Raft {
         );
     }
 
+    /// Send InstallSnapshot to a peer, map reply to `M` and send it to `tx`.
+    /// Will not send anything to tx if there's no reply.
     fn send_install_snapshot_and_map_reply<F, M>(
         &self,
         server: usize,
@@ -262,6 +284,7 @@ impl Raft {
     }
 }
 
+/// `Node` provides the raft service and can be cloned and shared between threads.
 #[derive(Clone)]
 pub struct Node {
     tx: Sender<Event>,
@@ -313,6 +336,8 @@ impl Node {
         rx.wait().unwrap_or(Err(Error::NotLeader))
     }
 
+    /// When RSM produces a new snapshot, it should call this method
+    /// to let raft save it together with raft state atomically.
     pub fn save_snapshot(&self, starting_index: u64, data: Vec<u8>) {
         let _ = self.tx.send(Event::SaveSnapshot {
             starting_index,

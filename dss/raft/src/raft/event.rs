@@ -13,36 +13,39 @@ use crate::raft::{ApplyMsg, ApplyMsgExt, Raft, State};
 const START_BATCH_MS: u64 = 2;
 const COMMIT_BATCH_MS: u64 = 30;
 
+/// All possible events for the raft event loop.
 #[derive(Debug)]
 pub enum Event {
-    Hello {
-        msg: String,
-    },
+    /// Sends a hello message
+    Hello { msg: String },
+    /// Tell the event loop to stop processing events
     Stop,
-    GetState {
-        tx: oneshot::Sender<State>,
-    },
+    /// Get raft leader and term information
+    GetState { tx: oneshot::Sender<State> },
+    /// Start a RSM command in raft
     StartCommand {
         command: Vec<u8>,
         tx: oneshot::Sender<Result<(u64, u64)>>,
     },
+    /// AppendEntries RPC event
     AppendEntries {
         args: AppendEntriesArgs,
         tx: oneshot::Sender<AppendEntriesReply>,
     },
+    /// InstallSnapshot RPC event
     InstallSnapshot {
         args: InstallSnapshotArgs,
         tx: oneshot::Sender<InstallSnapshotReply>,
     },
+    /// RequestVote RPC event
     RequestVote {
         args: RequestVoteArgs,
         tx: oneshot::Sender<RequestVoteReply>,
     },
+    /// Converted AppendEntries or InstallSnapshot RPC reply
     UpdateFollowerSummary(UpdateFollowerSummary),
-    SaveSnapshot {
-        starting_index: u64,
-        data: Vec<u8>,
-    },
+    /// RSM generated a new snapshot
+    SaveSnapshot { starting_index: u64, data: Vec<u8> },
 }
 
 pub enum Action {
@@ -67,6 +70,8 @@ macro_rules! persist_and_ack {
 }
 
 impl Raft {
+    /// The raft event loop.
+    /// It is the only owner of the `Raft` struct, and receives events from a channel.
     pub fn event_loop(mut self, events: Receiver<Event>, tx: Sender<Event>) {
         while self.state != Stopped {
             match self.state {
@@ -382,7 +387,7 @@ impl Raft {
             self.log.discard_logs_before(starting_index);
 
             // Generate new raft persist state
-            let state = self.get_persist_state();
+            let state = self.generate_persist_state();
             let mut raft_data = vec![];
             labcodec::encode(&state, &mut raft_data).unwrap();
 
@@ -498,7 +503,7 @@ impl Raft {
             }
 
             // Generate new raft persist state
-            let state = self.get_persist_state();
+            let state = self.generate_persist_state();
             let mut raft_data = vec![];
             labcodec::encode(&state, &mut raft_data).unwrap();
 
