@@ -45,7 +45,7 @@ impl Log {
     pub fn get_log_info(&self, index: u64) -> LogInfo {
         if index < self.start_index {
             // Trying to get a info that's already been discarded
-            unimplemented!("return Err(e)")
+            panic!("out of bounds");
         } else {
             self.entries[(index - self.start_index) as usize]
                 .info
@@ -85,7 +85,7 @@ impl Log {
         }
 
         if begin_index <= self.start_index {
-            unimplemented!("Should return some kind of error or panic (out of bounds)")
+            panic!("out of bounds");
         }
 
         let begin_idx = (begin_index - self.start_index) as usize;
