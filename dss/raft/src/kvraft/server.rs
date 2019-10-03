@@ -73,6 +73,15 @@ impl SharedServerState {
         }
     }
 
+    pub fn notify_fail_between(&self, first: u64, last: u64) {
+        let mut guard = self.req.lock().unwrap();
+        for index in first..=last {
+            if let Some(tx) = guard.remove(&index) {
+                let _ = tx.send(0);
+            }
+        }
+    }
+
     pub fn notify_fail_all(&self) {
         for (_, tx) in self.req.lock().unwrap().drain() {
             let _ = tx.send(0);
@@ -80,17 +89,19 @@ impl SharedServerState {
     }
 }
 
-#[allow(dead_code)] // TODO: remove
 pub struct KvServer {
     pub rf: raft::Node,
     me: usize,
     // snapshot if log grows this big
     maxraftstate: Option<usize>,
+    raft_state_size: usize,
     apply_ch: Option<UnboundedReceiver<raft::ApplyMsg>>,
     apply_index: u64,
     last_do_snapshot_index: u64,
     state: Arc<SharedServerState>,
 }
+
+const SNAPSHOT_THRESHOLD: f64 = 1.0;
 
 impl KvServer {
     pub fn new(
@@ -107,6 +118,7 @@ impl KvServer {
             rf: raft_node,
             me,
             maxraftstate,
+            raft_state_size: 0,
             apply_ch: Some(apply_ch),
             apply_index: 0,
             last_do_snapshot_index: 0,
@@ -127,6 +139,17 @@ impl KvServer {
                 // ApplyMsgExt
                 if let Some(ext) = msg.ext {
                     match ext {
+                        Stopped => {
+                            // Raft is stopping
+                            self.state.notify_fail_all();
+                            debug!("KvServer {} shutdown", self.me);
+                            return;
+                        }
+
+                        RaftStateSize(size) => {
+                            self.raft_state_size = size;
+                        }
+
                         ObtainLeadership => {
                             // Start Nop command to help commit
                             let _ = self.rf.start(&KvCommand {
@@ -134,14 +157,40 @@ impl KvServer {
                                 ..Default::default()
                             });
                         }
+
                         LostLeadership => {
                             // Drop all outstanding operations
                             self.state.notify_fail_all();
                         }
+
+                        InstallSnapshot(data) => {
+                            let old_apply_index = self.apply_index;
+                            self.load_snapshot(data);
+                            // Notify all previous outgoing req that it failed
+                            self.state
+                                .notify_fail_between(old_apply_index + 1, self.apply_index);
+                        }
                     }
                 }
             }
+
+            if let Some(cap) = self.maxraftstate {
+                if !msg.has_more_to_apply
+                    && self.raft_state_size >= (SNAPSHOT_THRESHOLD * cap as f64) as usize
+                    && self.last_do_snapshot_index < self.apply_index
+                {
+                    self.do_snapshot();
+                }
+            }
         }
+    }
+
+    fn load_snapshot(&mut self, _data: Vec<u8>) {
+        unimplemented!()
+    }
+
+    fn do_snapshot(&mut self) {
+        unimplemented!()
     }
 }
 
@@ -163,7 +212,7 @@ impl Node {
 
     /// the tester calls Kill() when a KVServer instance won't be needed again.
     pub fn kill(&self) {
-        // Your code here, if desired.
+        self.rf.kill();
     }
 
     /// The current term of this peer.

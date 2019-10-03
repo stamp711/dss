@@ -4,7 +4,6 @@ use crossbeam_channel::Sender;
 use futures::sync::mpsc::UnboundedSender;
 use futures::sync::oneshot;
 use futures::Future;
-
 use labrpc::RpcFuture;
 
 use crate::proto::raftpb::*;
@@ -30,12 +29,16 @@ pub struct ApplyMsg {
     pub command_index: u64,
     pub command_term: u64,
     pub ext: Option<ApplyMsgExt>,
+    pub has_more_to_apply: bool,
 }
 
 #[derive(Debug)]
 pub enum ApplyMsgExt {
+    Stopped,
     ObtainLeadership,
     LostLeadership,
+    RaftStateSize(usize),
+    InstallSnapshot(Vec<u8>),
 }
 
 /// Describe the role of a raft peer

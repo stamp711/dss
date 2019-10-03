@@ -72,6 +72,12 @@ impl Raft {
         // pending events in the channel buffer will not be cleaned.
         // When state transfers to Stopped, we need to ensure clean shutdown.
 
+        let _ = self.apply_ch.unbounded_send(ApplyMsg {
+            command_valid: false,
+            ext: Some(ApplyMsgExt::Stopped),
+            ..Default::default()
+        });
+
         // Drop events Sender
         drop(tx);
         // Cancel all remaining events while channel is still connected (have other Senders)
@@ -528,15 +534,16 @@ impl Raft {
                 .log
                 .get_entries(self.apply_index + 1, self.commit_index + 1)
             {
+                self.apply_index += 1;
                 msgs.push(ApplyMsg {
                     command_valid: true,
                     command: log.command,
                     command_index: log.info.index,
                     command_term: log.info.term,
                     ext: None,
+                    has_more_to_apply: self.apply_index < self.commit_index,
                 });
             }
-            self.apply_index = self.commit_index;
         }
 
         msgs
