@@ -9,6 +9,7 @@ pub mod raftpb {
         service raft {
             rpc append_entries(AppendEntriesArgs) returns (AppendEntriesReply);
             rpc request_vote(RequestVoteArgs) returns (RequestVoteReply);
+            rpc install_snapshot(InstallSnapshotArgs) returns (InstallSnapshotReply);
         }
     }
 }

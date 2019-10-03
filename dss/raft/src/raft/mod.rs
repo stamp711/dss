@@ -4,6 +4,7 @@ use crossbeam_channel::Sender;
 use futures::sync::mpsc::UnboundedSender;
 use futures::sync::oneshot;
 use futures::Future;
+
 use labrpc::RpcFuture;
 
 use crate::proto::raftpb::*;
@@ -339,6 +340,13 @@ impl RaftService for Node {
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(Event::RequestVote { args, tx })
+            .unwrap_or_default();
+        Box::new(rx.map_err(labrpc::Error::Recv))
+    }
+    fn install_snapshot(&self, args: InstallSnapshotArgs) -> RpcFuture<InstallSnapshotReply> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Event::InstallSnapshot { args, tx })
             .unwrap_or_default();
         Box::new(rx.map_err(labrpc::Error::Recv))
     }

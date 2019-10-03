@@ -6,6 +6,7 @@ use rand::{thread_rng, Rng};
 
 use crate::proto::raftpb::*;
 use crate::raft::errors::*;
+use crate::raft::log::Log;
 use crate::raft::RaftState::*;
 use crate::raft::{ApplyMsg, ApplyMsgExt, Raft, State};
 
@@ -28,6 +29,10 @@ pub enum Event {
     AppendEntries {
         args: AppendEntriesArgs,
         tx: oneshot::Sender<AppendEntriesReply>,
+    },
+    InstallSnapshot {
+        args: InstallSnapshotArgs,
+        tx: oneshot::Sender<InstallSnapshotReply>,
     },
     RequestVote {
         args: RequestVoteArgs,
@@ -335,6 +340,14 @@ impl Raft {
                 persist_and_ack!(self, tx, reply);
             }
 
+            Event::InstallSnapshot { args, tx } => {
+                let reply = self.process_install_snapshot(&args);
+                if self.state == Follower && args.term == self.term {
+                    action = Some(Action::ShouldResetTimer);
+                }
+                persist_and_ack!(self, tx, reply);
+            }
+
             Event::RequestVote { args, tx } => {
                 let reply = self.process_request_vote(&args);
                 if self.state == Follower && reply.vote_granted {
@@ -445,6 +458,67 @@ impl Raft {
         }
 
         // Reply success
+        reply.term = self.term;
+        reply.success = true;
+        reply
+    }
+
+    fn process_install_snapshot(&mut self, args: &InstallSnapshotArgs) -> InstallSnapshotReply {
+        let mut reply = InstallSnapshotReply::default();
+
+        // If request's term is larger than mine, update my term
+        if args.term > self.term {
+            self.update_term(args.term);
+        }
+
+        // Reply false if args.term < self.term
+        if args.term < self.term {
+            reply.term = self.term;
+            reply.success = false;
+            return reply;
+        }
+
+        // Now raft have same term as in args
+        if self.state == Candidate {
+            self.state = Follower;
+        }
+
+        // If we are ahead of the snapshot, just update commitIndex is enough
+        // If we are behind the snapshot (log.start_index < RPC last_included_info.index),
+        // we need to update our logs and save the received snapshot together with raft state
+        if args.last_included_info.index > self.log.start_index() {
+            // Update our logs to match snapshot
+            // Is last included log contained in our logs?
+            if self.log.check_existence(&args.last_included_info) {
+                // If so, discard logs before that
+                self.log.discard_logs_before(args.last_included_info.index);
+            } else {
+                // Create a new log
+                self.log = Log::new_with_prev_info(args.last_included_info.clone());
+            }
+
+            // Generate new raft persist state
+            let state = self.get_persist_state();
+            let mut raft_data = vec![];
+            labcodec::encode(&state, &mut raft_data).unwrap();
+
+            // Save snapshot data together with raft state
+            self.persister
+                .save_state_and_snapshot(raft_data, args.data.clone());
+
+            self.have_new_persist_state_size = true;
+            self.need_persist = false;
+        }
+
+        // Commit index can be advanced to snapshot's start_index
+        if self.commit_index < args.last_included_info.index {
+            self.commit_index = args.last_included_info.index;
+            debug!(
+                "Follower {} commit_index advances to {}",
+                self.me, self.commit_index
+            );
+        }
+
         reply.term = self.term;
         reply.success = true;
         reply

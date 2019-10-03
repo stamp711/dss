@@ -22,7 +22,7 @@ impl Log {
         }
     }
 
-    pub fn _new_with_prev_info(info: LogInfo) -> Self {
+    pub fn new_with_prev_info(info: LogInfo) -> Self {
         Self {
             start_index: info.index,
             entries: vec![LogEntry {
