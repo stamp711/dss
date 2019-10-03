@@ -7,6 +7,12 @@ enum Op {
     Append = 1;
 }
 
+message KvSnapshot {
+    required uint64 apply_index = 1;
+    map<string, string> kvs = 2;
+    map<string, uint64> latest = 3;
+}
+
 message RpcId {
     required string client_name = 1;
     required uint64 seq_id = 2;

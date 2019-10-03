@@ -34,6 +34,10 @@ pub enum Event {
         tx: oneshot::Sender<RequestVoteReply>,
     },
     UpdateFollowerSummary(UpdateFollowerSummary),
+    SaveSnapshot {
+        starting_index: u64,
+        data: Vec<u8>,
+    },
 }
 
 pub enum Action {
@@ -75,6 +79,7 @@ impl Raft {
         let _ = self.apply_ch.unbounded_send(ApplyMsg {
             command_valid: false,
             ext: Some(ApplyMsgExt::Stopped),
+            has_more_to_apply: self.apply_index < self.commit_index,
             ..Default::default()
         });
 
@@ -100,6 +105,7 @@ impl Raft {
         let _ = self.apply_ch.unbounded_send(ApplyMsg {
             command_valid: false,
             ext: Some(ApplyMsgExt::ObtainLeadership),
+            has_more_to_apply: self.apply_index < self.commit_index,
             ..Default::default()
         });
 
@@ -116,8 +122,8 @@ impl Raft {
             }
 
             // 2. Apply if needed
-            if self.need_apply {
-                self.update_state_machine();
+            if self.commit_index > self.apply_index || self.have_new_persist_state_size {
+                self.send_apply_messages();
             }
 
             // 3. Wait for Event, UpdateSummary or timeout
@@ -172,6 +178,7 @@ impl Raft {
         let _ = self.apply_ch.unbounded_send(ApplyMsg {
             command_valid: false,
             ext: Some(ApplyMsgExt::LostLeadership),
+            has_more_to_apply: self.apply_index < self.commit_index,
             ..Default::default()
         });
     }
@@ -211,8 +218,8 @@ impl Raft {
             // Loop for each event
             while self.state == Candidate {
                 // 1. Apply if needed
-                if self.need_apply {
-                    self.update_state_machine();
+                if self.commit_index > self.apply_index || self.have_new_persist_state_size {
+                    self.send_apply_messages();
                 }
 
                 // 2. Wait for an event, election reply, or election timeout
@@ -265,8 +272,8 @@ impl Raft {
 
         while self.state == Follower {
             // 1. Apply if needed
-            if self.need_apply {
-                self.update_state_machine();
+            if self.commit_index > self.apply_index || self.have_new_persist_state_size {
+                self.send_apply_messages();
             }
 
             // 2. Wait for an event or timeout
@@ -344,9 +351,34 @@ impl Raft {
                     }
                 }
             }
+
+            Event::SaveSnapshot {
+                starting_index,
+                data,
+            } => {
+                self.process_save_snapshot(starting_index, data);
+            }
         };
 
         action
+    }
+
+    fn process_save_snapshot(&mut self, starting_index: u64, snapshot_data: Vec<u8>) {
+        if starting_index > self.log.start_index() {
+            // Discard logs before snapshot
+            self.log.discard_logs_before(starting_index);
+
+            // Generate new raft persist state
+            let state = self.get_persist_state();
+            let mut raft_data = vec![];
+            labcodec::encode(&state, &mut raft_data).unwrap();
+
+            // Save raft state and snapshot atomically
+            self.persister
+                .save_state_and_snapshot(raft_data, snapshot_data);
+            self.have_new_persist_state_size = true;
+            self.need_persist = false;
+        }
     }
 
     fn process_start_command(&mut self, command: Vec<u8>) -> Result<(u64, u64)> {
@@ -406,7 +438,6 @@ impl Raft {
         // 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
         if args.leader_commit > self.commit_index {
             self.commit_index = args.leader_commit;
-            self.need_apply = true;
             debug!(
                 "Follower {} commit_index advances to {}",
                 self.me, self.commit_index
@@ -529,6 +560,29 @@ impl Raft {
     fn get_apply_messages(&mut self) -> Vec<ApplyMsg> {
         let mut msgs = vec![];
 
+        if self.have_new_persist_state_size {
+            msgs.push(ApplyMsg {
+                command_valid: false,
+                ext: Some(ApplyMsgExt::RaftStateSize(
+                    self.persister.raft_state().len(),
+                )),
+                has_more_to_apply: self.apply_index < self.commit_index,
+                ..Default::default()
+            });
+            self.have_new_persist_state_size = false;
+        }
+
+        if self.apply_index < self.log.start_index() {
+            // Give snapshot to RSM
+            msgs.push(ApplyMsg {
+                command_valid: false,
+                ext: Some(ApplyMsgExt::InstallSnapshot(self.persister.snapshot())),
+                has_more_to_apply: self.apply_index < self.commit_index,
+                ..Default::default()
+            });
+            self.apply_index = self.log.start_index();
+        }
+
         if self.commit_index > self.apply_index {
             for log in self
                 .log
@@ -549,13 +603,12 @@ impl Raft {
         msgs
     }
 
-    fn update_state_machine(&mut self) {
+    fn send_apply_messages(&mut self) {
         let msgs = self.get_apply_messages();
         for msg in msgs {
             let _ = self.apply_ch.unbounded_send(msg);
         }
         debug!("{} updated RSM to index {}", self.me, self.apply_index);
-        self.need_apply = false;
     }
 
     fn update_leader_commit(&mut self) -> bool {
@@ -570,7 +623,6 @@ impl Raft {
             && self.log.get_log_info(majority_index).term == self.term
         {
             self.commit_index = majority_index;
-            self.need_apply = true;
             true
         } else {
             false

@@ -6,9 +6,11 @@ use futures::future::ok;
 use futures::sync::mpsc::{unbounded, UnboundedReceiver};
 use futures::sync::oneshot;
 use futures::{Future, Stream};
+
 use labrpc::RpcFuture;
 
 use crate::proto::kvraftpb::*;
+use crate::raft::persister::Persister;
 use crate::raft::{self, ApplyMsgExt::*};
 
 /// States that are shared between apply_handler and RPC threads
@@ -110,11 +112,13 @@ impl KvServer {
         persister: Box<dyn raft::persister::Persister>,
         maxraftstate: Option<usize>,
     ) -> KvServer {
+        let snapshot_data = persister.snapshot();
+
         let (tx, apply_ch) = unbounded();
         let rf = raft::Raft::new(servers, me, persister, tx);
         let raft_node = raft::Node::new(rf);
 
-        KvServer {
+        let mut kv = KvServer {
             rf: raft_node,
             me,
             maxraftstate,
@@ -123,7 +127,14 @@ impl KvServer {
             apply_index: 0,
             last_do_snapshot_index: 0,
             state: Default::default(),
+        };
+
+        // Load snapshot if present
+        if !snapshot_data.is_empty() {
+            kv.load_snapshot(labcodec::decode(&snapshot_data).unwrap());
         }
+
+        kv
     }
 
     pub fn apply_handler(mut self) {
@@ -165,7 +176,7 @@ impl KvServer {
 
                         InstallSnapshot(data) => {
                             let old_apply_index = self.apply_index;
-                            self.load_snapshot(data);
+                            self.load_snapshot(labcodec::decode(&data).unwrap());
                             // Notify all previous outgoing req that it failed
                             self.state
                                 .notify_fail_between(old_apply_index + 1, self.apply_index);
@@ -185,12 +196,28 @@ impl KvServer {
         }
     }
 
-    fn load_snapshot(&mut self, _data: Vec<u8>) {
-        unimplemented!()
+    fn load_snapshot(&mut self, data: KvSnapshot) {
+        let mut kvs_guard = self.state.kvs.write().unwrap();
+        let mut latest_guard = self.state.latest.write().unwrap();
+        *kvs_guard = data.kvs;
+        *latest_guard = data.latest;
+        self.apply_index = data.apply_index;
     }
 
     fn do_snapshot(&mut self) {
-        unimplemented!()
+        // Generate snapshot data
+        let snapshot = KvSnapshot {
+            apply_index: self.apply_index,
+            kvs: self.state.kvs.read().unwrap().clone(),
+            latest: self.state.latest.read().unwrap().clone(),
+        };
+
+        // Encode and give it to raft
+        let mut data = vec![];
+        labcodec::encode(&snapshot, &mut data).unwrap();
+        self.rf.save_snapshot(self.apply_index, data);
+
+        self.last_do_snapshot_index = self.apply_index;
     }
 }
 

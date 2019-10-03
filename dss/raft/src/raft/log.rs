@@ -36,7 +36,7 @@ impl Log {
         self.start_index
     }
 
-    pub fn _discard_logs_before(&mut self, index: u64) {
+    pub fn discard_logs_before(&mut self, index: u64) {
         let end = (index - self.start_index) as usize;
         self.entries.drain(0..end);
         self.start_index = index

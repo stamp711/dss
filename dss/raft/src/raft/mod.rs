@@ -99,8 +99,8 @@ pub struct Raft {
     /// Indicates a pending persist operation.
     /// The pending persist must be performed before we communicate with the outside world.
     need_persist: bool,
-    /// Indicates that we have new stabilized logs that can be applied to the RSM.
-    need_apply: bool,
+    /// Indicates that we just saved raft state and have new persist size.
+    have_new_persist_state_size: bool,
     /// The candidate that we voted for in the current term
     voted_for: Option<u64>,
 
@@ -137,7 +137,7 @@ impl Raft {
             apply_index: 0,
             apply_ch,
             need_persist: false,
-            need_apply: true,
+            have_new_persist_state_size: false,
             voted_for: None,
             next_index: Default::default(),
             match_index: Default::default(),
@@ -157,6 +157,8 @@ impl Raft {
         let mut data = vec![];
         labcodec::encode(&state, &mut data).unwrap();
         self.persister.save_raft_state(data);
+
+        self.have_new_persist_state_size = true;
         self.need_persist = false;
     }
 
@@ -172,6 +174,13 @@ impl Raft {
         self.term = state.term;
         self.voted_for = state.voted_for;
         self.log = state.log;
+
+        // State machine should have already loaded the snapshot
+        self.apply_index = self.log.start_index();
+        self.commit_index = self.log.start_index();
+
+        // ..and we should give initial raft state size to RSM
+        self.have_new_persist_state_size = true;
     }
 
     /// restore previously persisted state.
@@ -278,6 +287,13 @@ impl Node {
             })
             .unwrap_or_default();
         rx.wait().unwrap_or(Err(Error::NotLeader))
+    }
+
+    pub fn save_snapshot(&self, starting_index: u64, data: Vec<u8>) {
+        let _ = self.tx.send(Event::SaveSnapshot {
+            starting_index,
+            data,
+        });
     }
 
     /// The current term of this peer.
